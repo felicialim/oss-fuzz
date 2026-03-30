@@ -27,7 +27,9 @@ import logging
 import os
 import posixpath
 import re
+import shlex
 import sys
+from typing import Optional
 
 import oauth2client.client
 import six
@@ -36,6 +38,7 @@ import yaml
 import build_lib
 
 FUZZING_BUILD_TYPE = 'fuzzing'
+INDEXER_BUILD_TYPE = 'indexer'
 
 GCB_LOGS_BUCKET = 'oss-fuzz-gcb-logs'
 GCB_EXPERIMENT_LOGS_BUCKET = 'oss-fuzz-gcb-experiment-logs'
@@ -62,20 +65,25 @@ BUILD_SUCCESS_MARKER = '/workspace/build.succeeded'
 _CACHED_IMAGE = ('us-central1-docker.pkg.dev/oss-fuzz/oss-fuzz-gen/'
                  '{name}-ofg-cached-{sanitizer}')
 _CACHED_SANITIZERS = ('address', 'coverage')
+_INDEXED_CONTAINER_NAME = 'indexed-container'
+_TRACING_CONTAINER_NAME = 'tracing-container'
 
 
 @dataclass
 class Config:
   testing: bool = False
-  test_image_suffix: str = None
-  repo: str = DEFAULT_OSS_FUZZ_REPO
-  branch: str = None
+  test_image_suffix: Optional[str] = None
+  base_image_tag: Optional[str] = None
+  repo: Optional[str] = DEFAULT_OSS_FUZZ_REPO
+  branch: Optional[str] = None
   parallel: bool = False
   upload: bool = True
   experiment: bool = False
   # TODO(ochang): This should be different per engine+sanitizer combination.
-  upload_build_logs: str = None
-  build_type: str = None
+  upload_build_logs: Optional[str] = None
+  build_type: Optional[str] = None
+  fuzzing_engine: Optional[str] = None
+  fuzz_target: Optional[str] = None
 
 
 # Allow the WORKDIR to be commented out for OSS-Fuzz-Gen, which creates new
@@ -125,7 +133,6 @@ def get_project_data(project_name):
     with open(dockerfile_path) as dockerfile:
       dockerfile = dockerfile.read()
   except FileNotFoundError:
-    logging.error('Project "%s" does not have a dockerfile.', project_name)
     raise
   project_yaml_path = os.path.join(project_dir, 'project.yaml')
   with open(project_yaml_path, 'r') as project_yaml_file_handle:
@@ -172,10 +179,13 @@ class Project:  # pylint: disable=too-many-instance-attributes
     self.labels = project_yaml['labels']
     self.fuzzing_language = project_yaml['language']
     self.run_tests = project_yaml['run_tests']
+    self.base_os_version = project_yaml.get('base_os_version', 'legacy')
     if 'main_repo' in project_yaml:
       self.main_repo = project_yaml['main_repo']
     else:
       self.main_repo = ''
+
+    self.indexer_targets = project_yaml.get('indexer', {}).get('targets', [])
 
     # This is set to enable build infra to use cached images (which are
     # specific to a sanitizer).
@@ -253,7 +263,7 @@ def get_datetime_now():
   return datetime.datetime.now()
 
 
-def get_env(fuzzing_language, build):
+def get_env(fuzzing_language, build, project_name=None):
   """Returns an environment for building. The environment is returned as a list
   and is suitable for use as the "env" parameter in a GCB build step. The
   environment variables are based on the values of |fuzzing_language| and
@@ -268,6 +278,8 @@ def get_env(fuzzing_language, build):
       'HOME': '/root',
       'OUT': build.out,
   }
+  if project_name is not None:
+    env_dict['PROJECT_NAME'] = project_name
   return list(sorted([f'{key}={value}' for key, value in env_dict.items()]))
 
 
@@ -280,11 +292,11 @@ def get_compile_step(project,
   """Returns the GCB step for compiling |projects| fuzzers using |env|. The type
   of build is specified by |build|."""
   failure_msg = (
-      '*' * 80 + '\nFailed to build.\nTo reproduce, run:\n'
-      f'python infra/helper.py build_image {project.name}\n'
+      '*' * 80 + '\\nFailed to build.\\nTo reproduce, run:\\n'
+      f'python infra/helper.py build_image {project.name}\\n'
       'python infra/helper.py build_fuzzers --sanitizer '
       f'{build.sanitizer} --engine {build.fuzzing_engine} --architecture '
-      f'{build.architecture} {project.name}\n' + '*' * 80)
+      f'{build.architecture} {project.name}\\n' + '*' * 80)
   compile_output_redirect = ''
 
   if upload_build_logs:
@@ -342,27 +354,29 @@ def get_build_steps(  # pylint: disable=too-many-locals, too-many-statements, to
     dockerfile,
     config,
     additional_env=None,
-    use_caching=False):
+    use_caching=False,
+    timestamp=None):
   """Returns build steps for project."""
 
   project = Project(project_name, project_yaml, dockerfile)
   return get_build_steps_for_project(project,
                                      config,
                                      additional_env=additional_env,
-                                     use_caching=use_caching)
+                                     use_caching=use_caching,
+                                     timestamp=timestamp), None
 
 
 def get_build_steps_for_project(project,
                                 config,
                                 additional_env=None,
-                                use_caching=False):
+                                use_caching=False,
+                                timestamp=None):
   """Returns build steps for project."""
 
-  if project.disabled:
-    logging.info('Project "%s" is disabled.', project.name)
-    return []
+  if not timestamp:
+    timestamp = get_datetime_now()
 
-  timestamp = get_datetime_now().strftime('%Y%m%d%H%M')
+  timestamp = timestamp.strftime('%Y%m%d%H%M')
 
   if use_caching:
     # For cached builds: the cache images are sanitizer-specific, so we need to
@@ -430,19 +444,21 @@ def get_build_steps_for_project(project,
 
         if project.run_tests:
           failure_msg = (
-              '*' * 80 + '\nBuild checks failed.\n'
-              'To reproduce, run:\n'
-              f'python infra/helper.py build_image {project.name}\n'
+              '*' * 80 + '\\nBuild checks failed.\\n'
+              'To reproduce, run:\\n'
+              f'python infra/helper.py build_image {project.name}\\n'
               'python infra/helper.py build_fuzzers --sanitizer '
               f'{build.sanitizer} --engine {build.fuzzing_engine} '
-              f'--architecture {build.architecture} {project.name}\n'
+              f'--architecture {build.architecture} {project.name}\\n'
               'python infra/helper.py check_build --sanitizer '
               f'{build.sanitizer} --engine {build.fuzzing_engine} '
-              f'--architecture {build.architecture} {project.name}\n' +
+              f'--architecture {build.architecture} {project.name}\\n' +
               '*' * 80)
           # Test fuzz targets.
+          runner_image_name = build_lib.get_runner_image_name(
+              config.test_image_suffix, config.base_image_tag)
           test_step = {
-              'name': build_lib.get_runner_image_name(config.test_image_suffix),
+              'name': runner_image_name,
               'env': env,
               'args': [
                   'bash', '-c',
@@ -473,7 +489,8 @@ def get_build_steps_for_project(project,
             # Generate targets list.
             {
                 'name':
-                    build_lib.get_runner_image_name(config.test_image_suffix),
+                    build_lib.get_runner_image_name(config.test_image_suffix,
+                                                    config.base_image_tag),
                 'env':
                     env,
                 'args': [
@@ -486,7 +503,168 @@ def get_build_steps_for_project(project,
           upload_steps = get_upload_steps(project, build, timestamp,
                                           config.testing)
           build_steps.extend(upload_steps)
+
   return build_steps
+
+
+def _indexer_built_image_name(name: str):
+  # TODO(ochang): Write this to a tar (via docker image save) and upload this to
+  # GCS.
+  return f'us-docker.pkg.dev/oss-fuzz/indexer/{name}'
+
+
+def _tracer_built_image_name(name: str):
+  # TODO(ochang): Write this to a tar (via docker image save) and upload this to
+  # GCS.
+  return f'us-docker.pkg.dev/oss-fuzz/tracer/{name}'
+
+
+def _create_indexed_build_steps(project,
+                                build,
+                                timestamp,
+                                env,
+                                indexer_targets,
+                                build_type='indexer'):
+  """Creates the build steps for a specific indexer type."""
+  if build_type == 'indexer':
+    container_name = _INDEXED_CONTAINER_NAME
+    image_name = _indexer_built_image_name(project.name)
+    build_script_command = '/opt/indexer/index_build.py'
+  elif build_type == 'tracer':
+    container_name = _TRACING_CONTAINER_NAME
+    image_name = _tracer_built_image_name(project.name)
+    build_script_command = (
+        '/opt/indexer/index_build.py --tracing-instrumentation')
+  else:
+    raise ValueError(f'Unknown build_type: {build_type}')
+
+  if indexer_targets:
+    build_script_command += ' -t ' + ','.join(indexer_targets)
+
+  command_sequence = [
+      'cd /src',
+      f'cd {project.workdir}',
+      f'mkdir -p {build.out}',
+      build_script_command,
+      # Enable re-building both the project and the indexes.
+      'cp -n /usr/local/bin/replay_build.sh $$SRC/',
+      # The following complicated dance is so that the resulting image works
+      # in a standalone way without the mount paths GCB installs by default
+      # (/workspace).
+      # First we save the $OUT contents into /outbak.
+      'mkdir -p /outbak && cp -a $$OUT/* /outbak/ && '
+      # Create a link from /out to the actual $OUT.
+      'rm -rf /out && ln -s $$OUT /out && '
+      # Unmount GCB's mount paths.
+      'umount /workspace && mkdir -p $$OUT && '
+      # Restore the actual contents into $OUT after unmounting.
+      'mv -T /outbak $$OUT && '
+      # Unshallow the main repository so we have easy access to the git history.
+      f'/usr/local/bin/unshallow_repos.py {project.main_repo}',
+  ]
+
+  build_step = {
+      'name': project.image,
+      'args': ['bash', '-c', ' && '.join(command_sequence)],
+      'env': env,
+  }
+  build_lib.dockerify_run_step(build_step,
+                               build,
+                               use_architecture_image_name=build.is_arm,
+                               container_name=container_name)
+
+  upload_steps = []
+  # TODO: Don't upload anything if we're in trial build.
+  if build_type == 'indexer':
+    prefix = f'indexer_indexes/{project.name}/{timestamp}/'
+    signed_policy_document = build_lib.get_signed_policy_document_upload_prefix(
+        'clusterfuzz-builds', prefix)
+    curl_signed_args = shlex.join(
+        build_lib.signed_policy_document_curl_args(signed_policy_document))
+    upload_steps = [
+        {
+            # TODO(metzman): Make sure not to include other tars, and support
+            # .tar.gz
+            'name': get_uploader_image(),
+            'args': [
+                '-c', f'for tar in {build.out}/*.tar; '
+                f'do curl {curl_signed_args} -F key="{prefix}$(basename $tar)" '
+                f'-F file="@$tar" https://{signed_policy_document.bucket}'
+                '.storage.googleapis.com; '
+                'done'
+            ],
+            'entrypoint': 'bash',
+            'allowFailure': True,
+        },
+        build_lib.upload_using_signed_policy_document('/workspace/srcmap.json',
+                                                      f'{prefix}srcmap.json',
+                                                      signed_policy_document)
+    ]
+
+  push_image_steps = [
+      {
+          'name':
+              build_lib.DOCKER_TOOL_IMAGE,
+          'args': [
+              'container', 'commit', '-c', 'ENV REPLAY_ENABLED 1',
+              container_name, image_name + f':{timestamp}'
+          ],
+      },
+      {
+          'name': build_lib.DOCKER_TOOL_IMAGE,
+          'args': ['tag', image_name + f':{timestamp}', image_name],
+      },
+      {
+          'name': build_lib.DOCKER_TOOL_IMAGE,
+          'args': ['push', '--all-tags', image_name],
+      },
+  ]
+  return [build_step] + upload_steps + push_image_steps
+
+
+def get_indexer_build_steps(project_name,
+                            project_yaml,
+                            dockerfile,
+                            config,
+                            additional_env=None,
+                            use_caching=False,
+                            timestamp=None):
+  """Get indexer build steps."""
+  project = Project(project_name, project_yaml, dockerfile)
+
+  if project.fuzzing_language not in {'c', 'c++'}:
+    return [], f'Project "{project.name}" is written in "{project.fuzzing_language}", indexer is not supported yet.'
+
+  if not timestamp:
+    timestamp = get_datetime_now()
+  timestamp = timestamp.strftime('%Y%m%d%H%M')
+
+  build_steps = build_lib.get_project_image_steps(
+      project.name,
+      project.image,
+      project.fuzzing_language,
+      config=config,
+      architectures=project.architectures,
+      experiment=config.experiment)
+  build = Build('none', 'address', 'x86_64')
+  env = get_env(project.fuzzing_language, build, project.name)
+  env.append('INDEXER_BUILD=1')
+  env.append('CAPTURE_REPLAY_SCRIPT=1')
+
+  indexer_steps = _create_indexed_build_steps(project,
+                                              build,
+                                              timestamp,
+                                              env,
+                                              project.indexer_targets,
+                                              build_type='indexer')
+
+  tracer_steps = _create_indexed_build_steps(project,
+                                             build,
+                                             timestamp,
+                                             env,
+                                             project.indexer_targets,
+                                             build_type='tracer')
+  return build_steps + indexer_steps + tracer_steps, None
 
 
 def get_targets_list_upload_step(bucket, project, build, uploader_image):
@@ -582,7 +760,8 @@ def run_build(oss_fuzz_project,
               build_type,
               cloud_project='oss-fuzz',
               extra_tags=None,
-              experiment=False):
+              experiment=False,
+              timeout=None):
   """Run the build for given steps on cloud build. |build_steps| are the steps
   to run. |credentials| are are used to authenticate to GCB and build in
   |cloud_project|. |oss_fuzz_project| and |build_type| are used to tag the build
@@ -591,7 +770,8 @@ def run_build(oss_fuzz_project,
     extra_tags = []
   tags = [oss_fuzz_project + '-' + build_type, build_type, oss_fuzz_project]
   tags.extend(extra_tags)
-  timeout = build_lib.BUILD_TIMEOUT
+  if timeout is None:
+    timeout = build_lib.BUILD_TIMEOUT
   bucket = GCB_LOGS_BUCKET if not experiment else GCB_EXPERIMENT_LOGS_BUCKET
   body_overrides = {
       'logsBucket': bucket,
@@ -607,9 +787,9 @@ def run_build(oss_fuzz_project,
                              experiment=experiment)
 
 
-def get_args(description):
-  """Parses command line arguments and returns them. Suitable for a build
-  script."""
+def parse_args(description, args):
+  """Parses command line arguments (or args if it is not None) and returns them.
+  Suitable for a build script."""
   parser = argparse.ArgumentParser(sys.argv[0], description=description)
   parser.add_argument('projects', help='Projects.', nargs='+')
   parser.add_argument('--testing',
@@ -621,6 +801,10 @@ def get_args(description):
                       required=False,
                       default=None,
                       help='Use testing base-images.')
+  parser.add_argument('--repo',
+                      required=False,
+                      default=DEFAULT_OSS_FUZZ_REPO,
+                      help='Use specified OSS-Fuzz repo.')
   parser.add_argument('--branch',
                       required=False,
                       default=None,
@@ -635,34 +819,46 @@ def get_args(description):
                       required=False,
                       default=False,
                       help='Configuration for experiments.')
-  return parser.parse_args()
+  parser.add_argument('--fuzzing-engine',
+                      required=False,
+                      default='libfuzzer',
+                      help='Fuzzing engine name.')
+  parser.add_argument('--fuzz-target',
+                      required=False,
+                      default='',
+                      help='Fuzz target name.')
+  return parser.parse_args(args)
 
 
-def create_config(args, build_type):
+def create_config(args, build_type, base_image_tag=None):
   """Create a Config object from parsed command line |args|."""
   upload = not args.experiment
   return Config(testing=args.testing,
                 test_image_suffix=args.test_image_suffix,
+                base_image_tag=base_image_tag,
                 branch=args.branch,
                 parallel=args.parallel,
                 upload=upload,
                 experiment=args.experiment,
-                build_type=build_type)
+                build_type=build_type,
+                fuzzing_engine=args.fuzzing_engine,
+                fuzz_target=args.fuzz_target)
 
 
-def build_script_main(script_description, get_build_steps_func, build_type):
+def build_script_main(script_description,
+                      get_build_steps_func,
+                      build_type,
+                      args=None):
   """Gets arguments from command line using |script_description| as helpstring
-  description. Gets build_steps using |get_build_steps_func| and then runs those
-  steps on GCB, tagging the builds with |build_type|. Returns 0 on success, 1 on
-  failure."""
-  args = get_args(script_description)
+  description or from args. Gets build_steps using |get_build_steps_func| and
+  then runs those steps on GCB, tagging the builds with |build_type|. Returns 0
+  on success, 1 on failure."""
+  args = parse_args(script_description, args)
   logging.basicConfig(level=logging.INFO)
 
   credentials = oauth2client.client.GoogleCredentials.get_application_default()
   error = False
-  config = create_config(args, build_type)
   for project_name in args.projects:
-    logging.info('Getting steps for: "%s".', project_name)
     try:
       project_yaml, dockerfile_contents = get_project_data(project_name)
     except FileNotFoundError:
@@ -670,8 +866,13 @@ def build_script_main(script_description, get_build_steps_func, build_type):
       error = True
       continue
 
-    steps = get_build_steps_func(project_name, project_yaml,
-                                 dockerfile_contents, config)
+    base_image_tag = project_yaml.get('base_os_version', 'legacy')
+    if base_image_tag == 'legacy':
+      base_image_tag = None
+    config = create_config(args, build_type, base_image_tag=base_image_tag)
+
+    steps, _ = get_build_steps_func(project_name, project_yaml,
+                                    dockerfile_contents, config)
     if not steps:
       logging.error('No steps. Skipping %s.', project_name)
       error = True
